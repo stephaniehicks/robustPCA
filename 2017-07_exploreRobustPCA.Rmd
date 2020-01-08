@@ -1,0 +1,334 @@
+
+---
+title: "Explore Robust PCA"
+author: "Stephanie Hicks"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=TRUE)
+```
+
+
+# Robust PCA
+
+- **Goal**: recover a low-rank matrix $L$ from highly “corrupted” measurements $M$ (where $M = L + S$) and L is the low-rank component and S is a sparse component with arbitrarily large magnitude of corruption (or errors). 
+    - Here the low rank or sparse components could be the object of interest. 
+    - vs Classic PCA: M = L + N where N is small noise. Here, we minimize the reconstruction error: $||M - L||$
+- **How to solve**: 
+    - Minimize $||L||_* + \lambda ||S||_1$ subject to $M = L + S$
+    - where $||L||_*$ is the nuclear norm (i.e. sum of singular values of $L$) and $||S||_1$ is the L1 norm
+    - Use **Principal Component Pursuit (PCP)** to solve minimization. 
+    - Assumptions of PCP: 
+        - $L$ is not sparse (use the incoherence condition = imposes a constraint on the singular vectors of $L$ to make them not sparse). 
+        - Sparsity pattern is uniformly at random and $S$ cannot be low-rank. 
+
+# Applications for Robust PCA
+
+* [Liu et al. (2013)](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3654929/): Used Robust PCA to discover differentially expressed (S) and non-differentially expressed genes (L) from a gene expression matrix (M). Positive and negative values in S represented down- and up-regulated genes, respectively. Evaluated discovered differential expressed genes using Gene Ontology. 
+
+
+# Available R packages for Robust PCA
+
+* [rpca R package](https://cran.r-project.org/web/packages/rpca/index.html) 
+  * The `rpca::rpca()` function decomposes a rectangular matrix M into a low-rank component, and a sparse component, by solving a convex program called *Principal Component Pursuit*. 
+* [pcaPP R package](https://cran.r-project.org/web/packages/pcaPP/index.html)
+
+
+# Try out `rpca` R package
+
+
+Load libraries
+```{r, message=FALSE}
+# library(devtools)
+# install_github("willtownes/patel2014gliohuman")
+library(patel2014gliohuman) 
+library(SummarizedExperiment)
+library(rpca)
+library(ggplot2)
+library(fields)
+library(cowplot)
+```
+
+
+## Simulated data
+
+```{r, echo = FALSE}
+genCluster<-function(n,id,mu=c(0,0),sigma=diag(2)){
+  d<-data.frame(MASS::mvrnorm(n,mu,sigma))
+  d$id<-id
+  return(d)
+}
+
+simulate_data <- function(L, G, N, Gsignal=G, U=NULL, y0=5, 
+                          std=list(w=2,u=2,v=1/sqrt(L))){
+  stopifnot(Gsignal>0 && Gsignal<=G)
+  w<-rnorm(G,0,std$w)
+  if(is.null(U)) U<-matrix(rnorm(N*L,0,std$u),nrow=L,ncol=N)
+  V<-matrix(rnorm(Gsignal*L,0,std$v),nrow=L,ncol=Gsignal)
+  Y<-t(V)%*%U
+  if(Gsignal<G){
+    Ynoise<-matrix(0,nrow=G-Gsignal,ncol=N)
+    Y<-rbind(Y,Ynoise)
+  }
+  #rows=genes,columns=cells
+  Y<-Y+w #take advantage of recycling to add same value to each row
+  Y<-y0+Y
+  mget(c("U","V","w","y0","Y")) #combine into list of parameters
+}
+rbeta2 <- function(N, mu, phi=max(1/mu,1/(1-mu))+0.1){
+  #return beta distributed variates with a given mean and precision
+  rbeta(N, phi*mu, phi*(1-mu))
+}
+
+censor_dat_mnar1 <- function(ptrue, cens_rates=0.5, mcar=0.3, 
+                             capture_eff=0.5, sigma_y=2){
+  # apply censoring using following formula
+  # ptrue is a list of true parameters from simulate_data()
+  # cens_rates is overall rate of missing data, including MCAR and MNAR parts
+  # mcar is the fraction of missing data that is MCAR
+  # ie, data mcar as a fraction of total data = mcar*censor_rate = "(1-k)"
+  # capture_eff is slope parameter for probit MNAR model. Typically >0
+  # sigma_y is stdev of observed Y values (measurement error noise)
+  # MNAR model determined as follows
+  # P(missing|eta_ng) = k*inv_probit(dn + capture_eff * eta_ng)
+  # k=1-mcar*censor_rate
+  # eta_ng = y0+an+wg+un'vg (from simulate_data function)
+  # analytically integrating over all gene specific parameters (wg and vg), we get a formula for marginal missingness for cell n. This is set equal to the censor_rate
+  # invert this formula to get implied dn values for each cell
+  # use average of these as the intercept in the probit model
+  # this leads to heterogeneity of the censoring rates, roughly centered around the desired censor_rate
+  # see also http://arxiv.org/abs/1603.06045v1
+  N<-ncol(ptrue$Y)
+  G<-nrow(ptrue$Y)
+  Yt<-t(ptrue$Y)
+  b1<-capture_eff
+  Qn<-1-cens_rates #overall detection rates for each cell
+  kn<-1-mcar*cens_rates #1-k = overall MCAR rates
+  stopifnot(all(kn>Qn))
+  #dn<-sapply(1:N,function(n){det2thresh(n,ptrue,Q,k,b1)})
+  dng<-t(qnorm(Qn/kn)-b1*Yt)
+  dn<-colMeans(dng)
+  probs<-t(kn*pnorm(dn + b1*Yt)) #implicit vectorization
+  U<-matrix(runif(N*G),nrow=G)
+  Z<-as.matrix(U<probs)
+  #hist(colMeans(Z))
+  #plot(Qn,colMeans(Z))
+  noise<-matrix(rnorm(N*G,0,sigma_y),nrow=G)
+  res<-(ptrue$Y+noise)*Z
+}
+
+```
+
+
+```{r}
+N = 48 # number of cells
+G = 500 # number of genes 
+L = 2 # dimension of latent subspace
+Gsignal <- G/2 # number of rows that have signal out of G rows (rest are noise)
+
+batch_labs<-data.frame(tumor=factor(rep(c("1","2"),each=N/2)),
+                       plate=factor(rep(rep(c("A","B"),each=N/4),2)))
+sigma <- matrix(c(1,0,0,1),nrow=2)
+mu <- list(c(1,1),c(-1, -1))
+dat <- do.call("rbind",lapply(1:2,function(x){genCluster(N/2,x,mu[[x]],sigma)})) # true latent structure
+colnames(dat)[1:2]<-paste0("dim",1:2)
+
+ref <- data.frame(dat[,1:2],batch_labs)
+
+p <- simulate_data(L=L, G=G, N=N, Gsignal=Gsignal, 
+                       U=t(as.matrix(ref[,1:2])), y0=5)
+# p <- simulate_data(L=L, G=G, N=N, Gsignal=Gsignal, U=NULL)
+
+#apply censoring MNAR
+cens_rates<-rep(NA,N)
+cens=c(.90,.05)
+cens_rates[batch_labs$plate=="A"]<-rbeta2(sum(batch_labs$plate=="A"),cens[1],phi=200)
+cens_rates[batch_labs$plate=="B"]<-rbeta2(sum(batch_labs$plate=="B"),cens[2],phi=200)
+
+p$Y_obs <- censor_dat_mnar1(p, cens_rates, mcar=0.1, capture_eff=1, sigma_y=1)
+
+Y_obs.cent <- sweep(p$Y_obs, 1, rowMeans(p$Y_obs), FUN = "-")
+
+```
+
+#### Classic PCA
+
+```{r, fig.width=12}
+sv <- svd(Y_obs.cent)
+
+par(mfrow=c(1,3))
+image.plot(t(p$Y), main = "truth", xlab = "cells", ylab = "genes")
+image.plot(t(Y_obs.cent), main = "censored", xlab = "cells", ylab = "genes")
+# out <- sv$u[,1:2] %*% diag(sv$d[1:2]) %*% t(sv$v[,1:2])
+out <- sv$u %*% diag(sv$d) %*% t(sv$v)
+image.plot(t(out), main = "reconstructed matrix using SVD", xlab = "cells", ylab = "genes")
+
+par(mfrow=c(1,3))
+image.plot(t(sv$u), main = "u", ylab = "genes")
+image.plot(diag(sv$d), main = "d")
+image.plot(sv$v, main = "v", xlab = "cells")
+```
+
+```{r,  fig.width=12, fig.height=6}
+# plot cells along first two PCs
+scores.pca <- data.frame(ref, sv$v[, 1:4])
+scores.pca$CDR <- colMeans(as.matrix(p$Y_obs) == 0)
+
+p0 <-  ggplot(scores.pca, aes(x = dim1, y = dim2, color = tumor, shape = plate)) + 
+    geom_point() + xlab("True Dim 1") + ylab("True Dim 2")
+p1 <- ggplot(scores.pca, aes(x = X1, y = X2, color = tumor, shape = plate)) + 
+    geom_point() + xlab("PC1") + ylab("PC2")
+
+p2 <- ggplot(scores.pca, aes(x = CDR, y = X1, color = tumor, shape = plate)) + 
+    geom_point() + xlab("detection rate") + ylab("PC1")
+
+plot_grid(p0, p1, p2, ncol = 3)
+```
+
+
+#### Robust PCA using `rpca` R package
+```{r}
+res <- rpca(t(Y_obs.cent)) 
+length(res$L.svd$d) # rank of low-rank component
+```
+
+```{r, fig.width=12}
+par(mfrow=c(1,4))
+image.plot(t(p$Y), main = "truth", xlab = "cells", ylab = "genes")
+# image.plot(t(sweep(p$Y, 1, rowMeans(p$Y), FUN = "-")), main = "truth (centered)", 
+#            xlab = "cells", ylab = "genes")
+image.plot(t(Y_obs.cent), main = "censored", xlab = "cells", ylab = "genes")
+image.plot(res$L.svd$L, main = "low-rank component (L)", xlab = "cells", ylab = "genes")
+image.plot(res$S, main = "sparse component (S)", xlab = "cells", ylab = "genes")
+
+# Plot images of $u$, $d$ and $v$ from $L$.
+par(mfrow=c(1,3))
+image.plot(res$L.svd$vt, main = "u", xlab = "rank k", ylab = "genes")
+image.plot(diag(res$L.svd$d), main = "d")
+image.plot(res$L.svd$u, main = "v", xlab = "cells", ylab = "rank k")
+```
+
+```{r, fig.width=12}
+# plot cells along first two low-rank components (L)
+scores.rpca <- data.frame(ref, res$L.svd$u[, 1:4])
+scores.rpca$CDR <- colMeans(as.matrix(p$Y_obs) == 0)
+
+p0.rpca <-  ggplot(scores.rpca, aes(x = dim1, y = dim2, color = tumor, shape = plate)) + 
+  geom_point() + xlab("True Dim 1") + ylab("True Dim 2")
+
+p1.rpca <- ggplot(scores.rpca, aes(x = X1, y = X2, color = tumor, shape = plate)) + 
+  geom_point() + xlab("RPC1") + ylab("RPC2")
+
+p2.rpca <- ggplot(scores.rpca, aes(x = CDR, y = X1, color = tumor, shape = plate)) + 
+  geom_point() + xlab("detection rate") + ylab("RPC1")
+
+plot_grid(p0.rpca, p1.rpca, p2.rpca, ncol = 3)
+```
+
+
+## Patel 2014 data
+
+Here we use Patel et al. (2014) data. Only pick cells from one tumor that were processed in two batches. 
+
+```{r}
+#### Load Patel et al. (2014) counts and phenotypic data
+data(patel_counts) # SummarizedExperiment
+dim(patel_counts)
+
+counts <- as.matrix(assay(patel_counts))
+pd = colData(patel_counts)
+pd$CDR <- colMeans(counts != 0)
+
+# filter for only single cells used in original analysis
+counts <- counts[, pd$sampleType == "SC" & pd$includeSample == TRUE & pd$cellType == "Glioblastoma" & pd$tumorName == "MGH26"]
+pd <- pd[pd$sampleType == "SC" & pd$includeSample == TRUE & pd$cellType == "Glioblastoma" & pd$tumorName == "MGH26", ]
+
+# normalize for library size
+cpm <- sweep(counts, 2, colSums(counts)/1e6, FUN = "/")
+
+# log transform and center each gene
+M <- log2(cpm + 1)
+Mcent <- sweep(M,1,rowMeans(M), FUN = "-")
+```
+
+#### Classic PCA
+```{r}
+sv  <- svd(Mcent[1:1000,])
+```
+
+Plot images of $M$, and reconstructed matrix. Note: only showing first 1000 genes here.
+```{r,  fig.width=12, eval}
+par(mfrow=c(1,2))
+image.plot(t(Mcent[1:1000,]), main = "M", xlab = "cells", ylab = "genes")
+out <- sv$u %*% diag(sv$d) %*% t(sv$v)
+image.plot(t(out), main = "reconstructed matrix using SVD", xlab = "cells", ylab = "genes")
+```
+
+```{r,  fig.width=12}
+par(mfrow=c(1,3))
+image.plot(t(sv$u), main = "u", ylab = "genes")
+image.plot(diag(sv$d), main = "d")
+image.plot(sv$v, main = "v", xlab = "cells")
+```
+
+```{r, fig.width=8}
+scores <- data.frame(pd, sv$v[, 1:2])
+p1.pca.patel <- ggplot(scores, aes(x = X1, y = X2, color = instrument)) + 
+  geom_point() + xlab("PC1") + ylab("PC2")
+
+p2.pca.patel <- ggplot(scores, aes(x = CDR, y = X1, color = instrument)) + 
+  geom_point() + xlab("detection rate") + ylab("PC1")
+
+plot_grid(p1.pca.patel, p2.pca.patel)
+
+```
+
+
+
+
+#### Robust PCA using `rpca` R package
+
+For speed, I only pick first 1000 genes. Look at both the low-rank component (L) and sparse component (S). 
+
+```{r}
+res <- rpca(t(Mcent[1:1000,])) # only pick first 1000 genes
+```
+
+```{r, fig.width=8}
+# low-rank component 
+str(res$L.svd)
+length(res$L.svd$d) # rank of low-rank component
+
+# plot cells along first two low-rank components (L)
+scores.rpca <- data.frame(pd, res$L.svd$u[, 1:4])
+
+p1.rpca.patel <- ggplot(scores.rpca, aes(x = X1, y = X2, color = instrument)) + 
+  geom_point() + xlab("RPC1") + ylab("RPC2")
+
+p2.rpca.patel <- ggplot(scores.rpca, aes(x = CDR, y = X1, color = instrument)) + 
+  geom_point() + xlab("detection rate") + ylab("RPC1")
+
+plot_grid(p1.rpca.patel, p2.rpca.patel)
+
+
+# sparse component
+dim(res$S)
+```
+
+Plot images of $M$, $L$ and $S$ (note: $M = L + S$). Note: only showing first 1000 genes here.
+```{r,  fig.width=12}
+par(mfrow=c(1,3))
+image.plot(t(Mcent[1:1000,]), main = "M", xlab = "cells", ylab = "genes")
+image.plot(res$L.svd$L, main = "low-rank component (L)", xlab = "cells", ylab = "genes")
+image.plot(res$S, main = "sparse component (S)", xlab = "cells", ylab = "genes")
+```
+
+Plot images of $u$, $d$ and $v$ from $L$.
+```{r,  fig.width=12}
+par(mfrow=c(1,3))
+image.plot(res$L.svd$vt, main = "u", xlab = "rank k", ylab = "genes")
+image.plot(diag(res$L.svd$d), main = "d")
+image.plot(res$L.svd$u, main = "v", xlab = "cells", ylab = "rank k")
+```
+
